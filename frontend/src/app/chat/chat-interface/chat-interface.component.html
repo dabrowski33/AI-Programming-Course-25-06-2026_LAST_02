@@ -1,7 +1,17 @@
-<mat-toolbar color="primary" class="chat-toolbar">
-  <span>Asystent NBP — Serwis Sprzętu</span>
+<mat-toolbar class="nbp-toolbar chat-toolbar">
+  <span class="nbp-logo-area">
+    <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="18" cy="18" r="17" stroke="#c4a84a" stroke-width="1.5" fill="#1c2d5e"/>
+      <circle cx="18" cy="18" r="14" stroke="#c4a84a" stroke-width="0.8" fill="none"/>
+      <text x="18" y="22" text-anchor="middle" font-family="Roboto,sans-serif" font-size="9" font-weight="700" fill="#c4a84a" letter-spacing="0.5">NBP</text>
+    </svg>
+    <span class="nbp-title-block">
+      <span class="nbp-title-main">Narodowy Bank Polski</span>
+      <span class="nbp-title-sub">Asystent Serwisu Sprzętu</span>
+    </span>
+  </span>
   <span class="spacer"></span>
-  <button mat-button (click)="newSession()">
+  <button mat-button class="nbp-new-btn" (click)="newSession()">
     <mat-icon>add_circle_outline</mat-icon>
     Nowe zgłoszenie
   </button>
@@ -35,8 +45,7 @@
 
   <button
     mat-fab
-    color="primary"
-    class="send-btn"
+    class="nbp-send-btn send-btn"
     [disabled]="isLoading || !inputText.trim()"
     (click)="sendMessage()"
     aria-label="Wyślij"
