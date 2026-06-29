@@ -2,191 +2,172 @@
 
 **Date:** 2026-06-24
 **Status:** Accepted
-**PRD:** `docs/PRD-Product-Requirements-Document.md`
+**PRD:** [`docs/PRD-Product-Requirements-Document.md`](../PRD-Product-Requirements-Document.md)
 
 ---
 
 ## 1. Overview
 
-This ADR defines the complete technical architecture for the Hardware Service Decision Copilot MVP — an internal web application that guides employees through a structured complaint/return form, analyses an uploaded equipment photo using a multimodal LLM, and delivers a rule-based decision via a streaming chat interface powered by a thinking LLM agent.
+This ADR set defines the technical architecture for the **Hardware Service Decision Copilot** — a self-service web app where a customer submits an electronics **return** or **complaint** with one photo, receives a preliminary, advisory eligibility decision produced by LLMs, and can then chat with the agent for follow-ups (PRD §1, §4).
 
-The PRD defines what the system must do and how it must behave. This ADR defines how it is built: stack, module boundaries, data contracts, environment setup, and testing strategy. Together they give an implementing agent a complete, unambiguous specification.
+This document (000) covers the overall system: stack, repository layout, module map, shared data models, cross-cutting decisions, environment, end-to-end flows, and the global testing strategy. Three area ADRs refine each layer:
+
+- [`001-backend-api.md`](001-backend-api.md) — Spring Boot API, session store, image compression, orchestration.
+- [`002-llm-integration.md`](002-llm-integration.md) — openai-java + OpenRouter, prompt strategy, structured outputs, streaming, API choice.
+- [`003-frontend.md`](003-frontend.md) — Angular + Angular Material UI, form, custom chat, SSE consumption.
+
+### Scope decisions carried from PRD clarifications
+- **Primary user:** end customer (self-service); decision is **advisory**, never binding.
+- **Streaming:** the **first decision message** is generated as a structured result and shown after a spinner; **follow-up chat turns stream** token-by-token over SSE.
+- **State:** server-side session store behind a `SessionStore` interface. The MVP shipped with an in-memory implementation; durable **H2 file-backed** persistence was since added — see [`004-persistence.md`](004-persistence.md), which supersedes the in-memory decision in §8.
+- **Run setup:** two local dev processes (Angular dev server → Spring Boot) with a dev proxy.
+- **LLM API:** **Chat Completions** via OpenRouter (not the Responses API — see §8 and ADR-002).
 
 ---
 
 ## 2. Context7 Library References
 
-All libraries used in this project. Implementing agents must use these handles to fetch docs — do not search for them again.
+Implementing agents must fetch docs using these handles — do not re-search.
 
 | Library | Context7 Handle | Used for |
 |---|---|---|
-| Next.js | `/vercel/next.js` | Full-stack framework — App Router, API routes, server actions |
-| Vercel AI SDK | `/vercel/ai` | LLM streaming, `streamText`, `generateText`, `useChat` hook |
-| React | `/reactjs/react.dev` | Frontend UI components and state |
-| Tailwind CSS | `/tailwindlabs/tailwindcss.com` | Utility-first CSS styling |
-| shadcn/ui | `/shadcn-ui/ui` | Accessible UI component primitives |
-| Zod | `/colinhacks/zod` | Runtime schema validation for API inputs and LLM outputs |
-| Sharp | `/lovell/sharp` | Server-side image compression before LLM submission |
-| Vitest | `/vitest-dev/vitest` | Unit and integration test runner |
-| Playwright | `/microsoft/playwright` | End-to-end browser tests |
+| OpenAI Java SDK | `/openai/openai-java` | LLM calls to OpenRouter (chat completions, vision, streaming, structured outputs) |
+| Spring Boot | `/spring-projects/spring-boot` | Backend REST API, multipart upload, SSE, validation, config |
+| Angular | `/websites/angular_dev` | Frontend SPA (standalone components, signals, HttpClient) |
+| Angular Material | `/websites/material_angular_dev` | UI components (form field, select, datepicker, progress, cards) |
+| ngx-markdown | `/jfcere/ngx-markdown` | Render the formatted Polish decision/chat messages as markdown |
+
+Version-pinned alternates (use if pinning): Spring Boot 3.5 → `/websites/spring_io_spring-boot_3_5`; Angular 18 → `/websites/v18_angular_dev`.
+
+Libraries without a confirmed handle (resolve with `resolve-library-id` at implementation time if docs are needed): **Thumbnailator** (Java image compression), **WireMock** (mock OpenRouter in tests), **Playwright** (E2E).
 
 ---
 
 ## 3. System Architecture
 
-### Architecture Pattern
+### Architecture pattern
+**SPA + REST API**, two independently built and run applications in one monorepo:
+- **Frontend:** Angular single-page app (standalone components, signal-based state).
+- **Backend:** Spring Boot **servlet (MVC)** application exposing a JSON/multipart REST API plus one SSE endpoint. MVC (not WebFlux) is chosen because the openai-java SDK is blocking; `SseEmitter` on a worker thread bridges the SDK's streaming iterator to the client cleanly (see §8).
 
-Single-repository Next.js application (monolith). Frontend (React, App Router) and backend (API Route Handlers) coexist in one Next.js project under `app/`. No separate backend service. No database in MVP.
+The backend persists case state in an embedded **H2** database (file-backed) via Spring Data JPA (see [`004-persistence.md`](004-persistence.md)). The backend is the only component that holds OpenRouter credentials and talks to the LLM provider; the browser never sees the API key.
 
-### Repository Structure
-
+### Repository structure
 ```
 app/
-  (form)/
-    page.tsx                  — Form screen (Screen 1)
-  (chat)/
-    page.tsx                  — Chat screen (Screen 3)
-  api/
-    analyse/
-      route.ts                — POST: receives form + image, runs multimodal LLM + agent, returns decision
-    chat/
-      route.ts                — POST: streaming chat endpoint (Vercel AI SDK streamText)
-  layout.tsx
-  globals.css
-
-components/
-  form/
-    ComplaintReturnForm.tsx   — Form component with all fields
-    ImageUpload.tsx           — File upload with preview
-  chat/
-    ChatInterface.tsx         — Chat UI shell
-    MessageBubble.tsx         — Single message rendering
-    DecisionBadge.tsx         — Decision result badge (Zaakceptowano / Odrzucono / Wymaga weryfikacji)
-
-lib/
-  llm/
-    multimodal.ts             — Multimodal LLM call (image analysis)
-    agent.ts                  — Thinking agent call (decision generation)
-    prompts.ts                — All prompt templates
-  compression/
-    image.ts                  — Sharp-based image compression
-  validation/
-    form.ts                   — Zod schemas for form input
-    api.ts                    — Zod schemas for API request/response bodies
-  procedures/
-    loader.ts                 — Loads complaint/return procedure markdown files at startup
-
+  backend/                 Spring Boot + Maven application
+    src/main/java/...       controllers, services, llm client, session store, dto
+    src/main/resources/     application.yaml, prompt templates, policy docs (copied/loaded)
+    src/test/java/...       unit + integration tests
+    pom.xml
+  frontend/                Angular + Angular Material application
+    src/app/                standalone components, services, models
+    src/app/features/intake/   intake form screen
+    src/app/features/chat/      chat screen
+    proxy.conf.json         dev proxy /api -> http://localhost:8080
+    package.json
 docs/
-  procedures/
-    complaint-procedure.md    — Injected into complaint agent prompt
-    return-procedure.md       — Injected into return agent prompt
-
-public/
-  assets/                     — Static assets (logo, favicon)
-
-.env.local                    — Local secrets (gitignored)
-.env.example                  — Template for required env vars
+  PRD-Product-Requirements-Document.md
+  ADR/                     this folder
+  policies/                polityka-zwrotow.md, polityka-reklamacji.md (injected into prompts)
 ```
+The two **policy documents** in `docs/policies/` are the source of truth for the agent's rules; the backend loads their text at startup and injects it into the decision prompts (ADR-002). Implementation may copy them into `backend/src/main/resources` or read them from the repo path — decided in ADR-001.
 
-### Technology Stack
+### Technology stack
 
 | Layer | Technology | Reason |
 |---|---|---|
-| Frontend framework | Next.js 14+ (App Router) | Full-stack in one project; server components reduce client bundle; built-in API routes |
-| UI components | shadcn/ui + Tailwind CSS | Accessible, unstyled primitives + utility CSS; no runtime CSS-in-JS |
-| AI/LLM integration | Vercel AI SDK (`streamText`, `generateText`) | First-class Next.js integration; provider-agnostic; streaming chat via `useChat` |
-| Multimodal LLM | Claude claude-sonnet-4-6 (claude-sonnet-4-6) via Anthropic | State-of-the-art vision + text; same provider as thinking agent; one API key |
-| Thinking LLM | Claude claude-sonnet-4-6 with extended thinking via Anthropic | Extended reasoning for reliable rule-based decisions; same provider |
-| Schema validation | Zod | TypeScript-first; used for API input validation and LLM output parsing |
-| Image compression | Sharp (server-side, API route) | High-performance Node.js image processing; reduces image to ≤ 1 MB before LLM call |
-| Session state | React state (`useState` / `useReducer`) in client components | No DB in MVP; form data and chat history live in browser memory for the session duration |
-| Testing — unit/integration | Vitest | Fast, native ESM, compatible with Next.js and Vercel AI SDK mocking patterns |
-| Testing — E2E | Playwright | Browser automation; tests the full user journey end-to-end |
+| Backend runtime | Java 21 (LTS) | Current LTS; supported by openai-java and Spring Boot 3.5 |
+| Backend framework | Spring Boot 3.5.x (Spring Web MVC) | Mature servlet stack; first-class multipart, validation, `SseEmitter`; matches team expertise |
+| Build (backend) | Maven | Explicitly requested; standard for Spring Boot |
+| Persistence | H2 (file-backed) + Spring Data JPA | Embedded, pure-Java, zero native deps; durable session/audit store (ADR-004) |
+| LLM SDK | openai-java `com.openai:openai-java` (4.41.0, verify latest patch) | Official SDK; configurable base URL → OpenRouter; supports vision, streaming, structured outputs |
+| LLM provider | OpenRouter (Chat Completions API) | Provider per `.env.example`; normalized GA endpoint with stable vision + streaming + structured outputs |
+| Image compression | Thumbnailator (or built-in ImageIO) | Simple downscale + JPEG re-encode before base64 (ADR-001) |
+| Frontend framework | Angular (latest stable; pin Material + ngx-markdown to same major) | Explicitly requested; standalone components + signals suit streaming UI |
+| UI components | Angular Material | Explicitly requested; covers form field, select, datepicker, progress, cards |
+| Chat UI | Custom component built on Material primitives | No maintained, non-SaaS Material chat library exists (see ADR-003) |
+| Markdown | ngx-markdown | De-facto Angular markdown renderer; sanitizes output |
+| Build (frontend) | Angular CLI | Standard; provides dev server + proxy |
 
 ---
 
 ## 4. Module Structure & Dependencies
 
-```
-components/form/         → depends on: lib/validation/form.ts
-components/chat/         → depends on: Vercel AI SDK (useChat)
-app/(form)/page.tsx      → depends on: components/form/, lib/validation/form.ts
-app/(chat)/page.tsx      → depends on: components/chat/
-app/api/analyse/route.ts → depends on: lib/compression/image.ts, lib/llm/multimodal.ts, lib/llm/agent.ts, lib/validation/api.ts, lib/procedures/loader.ts
-app/api/chat/route.ts    → depends on: Vercel AI SDK (streamText), lib/llm/prompts.ts
-lib/llm/multimodal.ts    → depends on: Vercel AI SDK (generateText), lib/llm/prompts.ts
-lib/llm/agent.ts         → depends on: Vercel AI SDK (generateText), lib/llm/prompts.ts, lib/procedures/loader.ts
-lib/llm/prompts.ts       → no internal dependencies (pure string templates)
-lib/compression/image.ts → depends on: Sharp
-lib/procedures/loader.ts → depends on: Node.js `fs` (reads markdown files at startup)
-lib/validation/          → depends on: Zod only
-```
+### Backend modules (packages)
+- **`web` (controllers)** — REST + SSE endpoints; request/response DTOs; validation; error mapping. Depends on `application` services. Nothing depends on it.
+- **`application` (orchestration services)** — `CaseService` (form→analysis→decision orchestration), `ChatService` (follow-up streaming). Depends on `llm`, `session`, `image`, `policy`. Depended on by `web`.
+- **`llm` (LLM gateway)** — wraps openai-java; exposes `analyzeImage(...)`, `decide(...)`, `streamChat(...)`. Depends on SDK + config. Depended on by `application`. (ADR-002)
+- **`image` (compression)** — `ImageCompressor`. Pure utility. Depended on by `application`.
+- **`session` (state)** — `SessionStore` interface with a default **H2/JPA implementation** (`JpaSessionStore`) and an in-memory implementation for tests. Depended on by `application`. The interface is the seam that let persistence be added without touching orchestration (see [`004-persistence.md`](004-persistence.md)).
+- **`policy` (rules loader)** — loads the two policy documents’ text. Depended on by `application`/`llm`.
+- **`config`** — client/bean wiring, environment binding. Depended on by all.
 
-Dependency direction is strictly inward: `app/` → `components/` → `lib/` → external packages. No circular dependencies. `lib/` modules never import from `app/` or `components/`.
+Dependency direction is strictly inward: `web → application → {llm, session, image, policy}`. No circular dependencies.
+
+### Frontend modules
+- **`core`** — API service (HTTP + SSE), models, error handling.
+- **`features/intake`** — intake form component + form state.
+- **`features/chat`** — custom chat component, message list, composer, markdown rendering, SSE consumption.
+- **`shared`** — reusable UI bits, validators.
+
+Direction: `features → core`; `shared` is leaf. No feature depends on another feature directly; navigation form→chat is via the router/state.
 
 ---
 
 ## 5. Data Models
 
-### FormSubmission
-Represents the validated data collected from the form before submission.
+Conceptual (no schema code). Persisted durably in an embedded **H2** database via Spring Data JPA (see [`004-persistence.md`](004-persistence.md)); `ImageAnalysis` and `DecisionResult` are stored as JSON columns. The uploaded image bytes are **not** persisted (future backlog — S3-compatible blob).
 
-| Field | Type | Notes |
-|---|---|---|
-| `requestType` | `"reklamacja" \| "zwrot"` | Determines which LLM prompts and procedure doc to use |
-| `equipmentCategory` | `string` (enum of 8 values) | Predefined category list from PRD Section 8 |
-| `equipmentModel` | `string` | Max 200 chars, free text |
-| `purchaseDate` | `Date` | Must not be in the future |
-| `complaintReason` | `string \| undefined` | Required when `requestType === "reklamacja"`, max 2000 chars |
-| `imageFile` | `File` | Validated: JPG/PNG/WebP, max 10 MB |
+### CaseSession
+The aggregate for one customer case.
+- `sessionId` — opaque unique id (string).
+- `type` — enum: `REKLAMACJA` (complaint) | `ZWROT` (return).
+- `category` — enum from the fixed equipment list (PRD §8).
+- `model` — string (device model/name).
+- `purchaseDate` — date (must not be future).
+- `reason` — string; required when `type = REKLAMACJA`.
+- `imageAnalysis` — `ImageAnalysis` (below).
+- `decision` — `DecisionResult` (below).
+- `messages` — ordered list of `ChatMessage`.
+- `createdAt` — timestamp.
+Relationships: one CaseSession has one ImageAnalysis, one DecisionResult, many ChatMessages.
 
-### ImageAnalysisResult
-Returned by the multimodal LLM after analysing the uploaded photo.
+### ImageAnalysis (output of the vision model)
+- `summary` — short Polish/neutral description of what is visible.
+- `observations` — list of key visual findings.
+- `scenarioFlags` — scenario-specific structured fields:
+  - Return: `signsOfUse` (bool/uncertain), `visibleDamage` (bool/uncertain), `complete` (bool/uncertain), `resellableAsNew` (bool/uncertain).
+  - Complaint: `visibleDamage` (bool), `damageType` (string), `likelyCause` (enum: `MANUFACTURING_DEFECT` | `USER_CAUSED` | `NORMAL_WEAR` | `INCONCLUSIVE`).
+- `confidence` — low/medium/high (drives escalation).
 
-| Field | Type | Notes |
-|---|---|---|
-| `status` | `"ok" \| "unreadable"` | `"unreadable"` triggers the re-upload error flow |
-| `conditionSummary` | `string` | Human-readable description of visible condition |
-| `damagePresent` | `boolean` | Whether damage is visible |
-| `damageType` | `string \| null` | Type/location of damage if present |
-| `likelyCause` | `"manufacturing_defect" \| "user_damage" \| "wear_and_tear" \| "unknown" \| null` | Complaint scenario only |
-| `signsOfUse` | `boolean \| null` | Return scenario only |
-| `resalable` | `boolean \| null` | Return scenario only |
-| `unreadableReason` | `string \| null` | Populated when `status === "unreadable"` |
+### DecisionResult (output of the decision agent — structured)
+- `category` — enum: `ELIGIBLE` | `NOT_ELIGIBLE` | `NEEDS_HUMAN_REVIEW` | `MORE_INFO_REQUIRED` (PRD AC-15).
+- `justification` — Polish text referencing photo findings + applicable policy rule (AC-17).
+- `nextSteps` — Polish text/list.
+- `missingInfo` — list, populated only for `MORE_INFO_REQUIRED`.
+Note: the **disclaimer is NOT taken from the model** — it is appended deterministically by the backend (AC-24), so it is always present and consistent.
 
-### AgentDecision
-Returned by the thinking agent after evaluating the case against procedure rules.
-
-| Field | Type | Notes |
-|---|---|---|
-| `decision` | `"zaakceptowano" \| "odrzucono" \| "wymaga_weryfikacji"` | The decision result |
-| `justification` | `string` | Narrative explanation referencing specific rules |
-| `rulesApplied` | `string[]` | Array of rule IDs cited (e.g. `["RULE-C-05", "RULE-C-13"]`) |
-| `nextSteps` | `string[]` | Numbered list of recommended employee actions |
-| `disclaimer` | `string` | Static AI-generated decision disclaimer text (Polish) |
-
-### ChatSession
-Held in React state on the client for the duration of the browser session.
-
-| Field | Type | Notes |
-|---|---|---|
-| `formData` | `FormSubmission` | Original form values, included in system prompt |
-| `imageAnalysis` | `ImageAnalysisResult` | Included in system prompt |
-| `initialDecision` | `AgentDecision` | Displayed as first chat message |
-| `messages` | `Message[]` | Vercel AI SDK `useChat` message array |
+### ChatMessage
+- `role` — `assistant` | `user`.
+- `content` — markdown string.
+- `createdAt` — timestamp.
+The agent's first message (the formatted decision) is the first `assistant` message, assembled by the backend from `DecisionResult` + fixed greeting/disclaimer templates.
 
 ---
 
 ## 6. API / Interface Contracts
 
-See `docs/ADR/001-backend-api.md` for detailed endpoint specifications.
+Base path `/api/v1`. Full field-level detail in ADR-001.
 
-**Summary of endpoints:**
+| Endpoint | Method | Input | Output | Notes |
+|---|---|---|---|---|
+| `/cases` | POST (multipart/form-data) | form fields + one image | `{ sessionId, decision, firstMessage, caseSummary }` (JSON) | Validates, compresses image, runs vision + decision; creates session |
+| `/cases/{sessionId}/messages` | POST | `{ message }` (JSON) | `text/event-stream` of token deltas + terminal event | Follow-up chat; **streamed** (SSE) |
+| `/cases/{sessionId}` | GET | — | `{ caseSummary, decision, transcript }` (JSON) | Restores the chat on reload/deep-link/after restart (ADR-004); `404` if unknown |
+| `/health` | GET | — | status | Liveness (Spring Boot Actuator acceptable) |
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/analyse` | Receives multipart form data (form fields + image), compresses image, runs multimodal LLM analysis, runs thinking agent, returns `AgentDecision` + `ImageAnalysisResult` |
-| `POST` | `/api/chat` | Vercel AI SDK streaming chat endpoint; receives messages array + system context, streams agent response |
+Error model (shared): JSON `{ code, message, fields? }` with appropriate HTTP status. Concrete codes/statuses in ADR-001 (validation 400, unsupported type 415, too large 413, unknown session 404, upstream LLM failure 502/503).
 
 ---
 
@@ -194,271 +175,213 @@ See `docs/ADR/001-backend-api.md` for detailed endpoint specifications.
 
 | Variable | Purpose | Required | Example value |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude models | Yes | `sk-ant-...` |
-| `NEXT_PUBLIC_APP_TITLE` | Application title shown in UI | No | `Hardware Service Decision Copilot` |
+| `OPENROUTER_API_KEY` | OpenRouter credential (used unless `OPENAI_API_KEY` is set) | Yes | `sk-or-v1-...` |
+| `OPENROUTER_BASE_URL` | LLM API base URL | Yes | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_TEXT_MODEL` | Model for decision + chat reasoning | Yes | `openai/gpt-5.4-mini` |
+| `OPENROUTER_VISION_MODEL` | Model for multimodal image analysis | Yes | `openai/gpt-5.4-mini` |
+| `OPENROUTER_MODEL` | Fallback model if a split var is missing | No | `openai/gpt-5.4-mini` |
+| `OPENAI_API_KEY` | Optional override credential; if set, used instead of `OPENROUTER_API_KEY` | No | `sk-...` |
+| `OPENROUTER_APP_URL` | Optional `HTTP-Referer` header for OpenRouter attribution | No | `http://localhost:4200` |
+| `OPENROUTER_APP_TITLE` | Optional `X-Title` header for OpenRouter attribution | No | `Hardware Service Decision Copilot` |
+| `SERVER_PORT` | Backend port | No | `8080` |
 
-No database connection strings, no auth secrets — MVP has no persistence and no authentication.
+The backend reads these via Spring configuration. The frontend never receives credentials; it calls the backend only.
 
 ---
 
 ## 8. Technical Decisions
 
-### Next.js full-stack monolith (no separate backend service)
-**Status:** Accepted
-**Date:** 2026-06-24
-**Context:** The PRD describes a simple two-screen SPA with two AI-powered backend operations. No database, no auth, no microservice communication is needed in MVP.
-**Decision:** Use Next.js App Router as both the frontend framework and the backend API host. API route handlers in `app/api/` handle image processing and LLM calls server-side.
+### Chat Completions API over the Responses API
+**Status:** Accepted **Date:** 2026-06-24
+**Context:** OpenRouter exposes both a Chat Completions and a Responses endpoint; we must pick one for vision and for multi-turn chat.
+**Decision:** Use **Chat Completions** through OpenRouter for both image analysis and chat. OpenRouter's Responses endpoint is documented as **beta, stateless, and feature-thin** (streaming/structured-outputs/vision not documented there), while Chat Completions is the normalized GA path with stable vision (base64 `image_url`), SSE streaming, and `response_format` structured outputs. The openai-java SDK speaks both with equal effort, so there is no SDK cost to this choice.
 **Rejected alternatives:**
-- Separate Express/Fastify backend: Adds deployment complexity and a second process for no benefit at MVP scale.
-- Java/Spring Boot backend: The course primary demo stack is TypeScript. Java remains a participant option but the demo uses Next.js.
-**Consequences:**
-- (+) One repository, one deployment, one `npm run dev` to start everything.
-- (-) API routes share the Next.js runtime; CPU-heavy image compression (Sharp) blocks the event loop unless offloaded — mitigated by Sharp's native async API.
-**Review trigger:** If the backend needs to scale independently from the frontend, or if Java is chosen as the course implementation language.
+- *Responses API:* beta on OpenRouter, stateless anyway (no server-side history benefit), vision/streaming undocumented there.
+- *Provider-native (OpenAI direct):* contradicts the `.env.example` OpenRouter setup and reduces model flexibility.
+**Consequences:** (+) Most reliable, model-agnostic feature set. (+) Same SDK, same code path for both calls. (−) We manage conversation history ourselves (acceptable; we hold it in the session store anyway).
+**Review trigger:** If OpenRouter promotes Responses to GA with vision+streaming, or if we need server-side conversation state from the provider.
 
-### Claude claude-sonnet-4-6 for both multimodal analysis and thinking agent
-**Status:** Accepted
-**Date:** 2026-06-24
-**Context:** The system requires two distinct LLM roles: a vision-capable model for image analysis and a reasoning-capable model for rule-based decision making.
-**Decision:** Use `claude-sonnet-4-6` for the multimodal image analysis call (vision + text) and `claude-sonnet-4-6` with extended thinking enabled for the decision agent. Single Anthropic API key, single provider, consistent latency profile.
+### Spring Web MVC + SseEmitter (not WebFlux)
+**Status:** Accepted **Date:** 2026-06-24
+**Context:** The chat must stream tokens, but the openai-java SDK returns a blocking `StreamResponse`, not a reactive `Flux`.
+**Decision:** Use the **servlet stack (Spring MVC)** and return an `SseEmitter` from the chat endpoint; a worker thread iterates the SDK's streaming chunks and pushes SSE events. This avoids manually bridging a blocking iterator into a reactive pipeline.
 **Rejected alternatives:**
-- GPT-4o (multimodal) + o1 (reasoning): Would require an OpenAI API key in addition to or instead of Anthropic; splits provider configuration.
-- OpenRouter as a proxy: Adds an intermediary with its own latency and failure modes; not needed for MVP with a single provider.
-**Consequences:**
-- (+) One API key, one SDK configuration, predictable pricing.
-- (-) Vendor lock-in to Anthropic; switching models requires changes to `lib/llm/` only.
-**Review trigger:** If Anthropic API availability or pricing becomes a constraint, or if a different model shows materially better decision quality on the procedure rules.
+- *Spring WebFlux:* would require wrapping the blocking SDK stream onto a bounded-elastic scheduler / `Sinks.Many` — more complexity for no MVP benefit.
+**Consequences:** (+) Simple, well-understood concurrency model; one worker thread per active stream. (−) Thread-per-stream does not scale to thousands of concurrent chats (irrelevant at MVP scale).
+**Review trigger:** If concurrent active chat streams are expected to exceed a few hundred.
 
-### React client state for session management (no server-side session)
-**Status:** Accepted
-**Date:** 2026-06-24
-**Context:** The PRD explicitly defers session persistence to a later phase. Chat history and form data only need to survive within a single browser tab session.
-**Decision:** Store `FormSubmission`, `ImageAnalysisResult`, `AgentDecision`, and chat messages in React component state (`useState`). Pass form context to the chat API via the `useChat` system prompt mechanism on each request.
+### Session store behind an interface (in-memory → H2)
+**Status:** Superseded by [`004-persistence.md`](004-persistence.md) **Date:** 2026-06-24 (superseded 2026-06-25)
+**Context:** Conversation context (form, image analysis, decision, transcript) must persist across turns.
+**Decision (original):** Define a `SessionStore` interface with an in-memory (concurrent map) implementation, keyed by `sessionId`. The interface is the seam to later add a durable implementation without touching orchestration code.
+**Update (2026-06-25):** The Backlog persistence item was delivered. A durable **H2 file-backed** `JpaSessionStore` is now the default implementation behind the same interface; the in-memory store is retained for tests. The engine is **H2, not SQLite** — full rationale in [`004-persistence.md`](004-persistence.md) §6. Orchestration code was unchanged, validating the seam.
 **Rejected alternatives:**
-- Server-side session (Redis/in-memory): Adds infrastructure complexity with no PRD requirement.
-- localStorage: Would survive page refresh, but cross-tab isolation and stale state are harder to manage; not needed for MVP.
-**Consequences:**
-- (+) Zero infrastructure beyond Next.js; trivially simple.
-- (-) Session lost on page refresh — explicitly acceptable per PRD out-of-scope definition.
-**Review trigger:** When session persistence is added (PRD optional feature).
+- *Stateless (client resends full history):* larger payloads, client owns transcript, and re-uploading image-analysis context each turn is awkward.
+- *SQLite:* its only differentiator (doubling as a vector store) is not production-ready from Java; see ADR-004 §6.
+**Consequences:** (+) Small payloads; (+) durable across restarts. (−) H2 file is single-instance (acceptable for the MVP).
+**Review trigger:** Running more than one backend instance, or the future vector ADR selecting a server DB (Postgres) — see ADR-004 §9.
 
-### Streaming chat responses via Vercel AI SDK `streamText`
-**Status:** Accepted
-**Date:** 2026-06-24
-**Context:** The thinking agent with extended reasoning can take 10–30 seconds to produce a full response. Streaming allows the UI to show tokens as they arrive rather than blocking the user.
-**Decision:** Use Vercel AI SDK `streamText` in `app/api/chat/route.ts` and the `useChat` hook in the frontend `ChatInterface` component. The initial decision (from `/api/analyse`) is NOT streamed — it is a single blocking call that returns a complete `AgentDecision` JSON before the chat screen opens.
+### Backend appends the mandatory disclaimer deterministically
+**Status:** Accepted **Date:** 2026-06-24
+**Context:** Every decision message must include the legal disclaimer (PRD AC-24), and the decision category must be one of four fixed values (AC-15).
+**Decision:** The decision agent returns a **structured** `DecisionResult` (category enum + justification + next steps) via the LLM's structured-output mode; the backend composes the customer-facing first message from fixed Polish greeting/disclaimer templates plus the model's justification/next-steps. The disclaimer text is never delegated to the model.
 **Rejected alternatives:**
-- Non-streaming (full response wait): Unacceptable UX for a model with extended thinking; user would see a blank screen for 10–30 seconds.
-- Server-Sent Events manually: Vercel AI SDK already implements this pattern; reimplementing it adds complexity.
-**Consequences:**
-- (+) Progressive rendering; better perceived performance.
-- (-) `/api/analyse` (first call) is still blocking — loading screen with status messages mitigates this per PRD Screen 2 spec.
-**Review trigger:** If the initial `/api/analyse` call exceeds 30 seconds consistently; consider streaming that call too.
+- *Let the model produce the whole message including disclaimer:* risks missing/altered disclaimer and free-form categories.
+**Consequences:** (+) Guarantees AC-15 and AC-24 deterministically; easier to test. (−) Slightly less "natural" phrasing; mitigated by passing justification/next-steps through verbatim.
+**Review trigger:** If product wants fully model-authored messages.
 
-### Sharp for server-side image compression
-**Status:** Accepted
-**Date:** 2026-06-24
-**Context:** The PRD requires backend compression to ≤ 1 MB before sending to the multimodal LLM. Client-side compression was considered.
-**Decision:** Compress images server-side in `app/api/analyse/route.ts` using Sharp. Target output: JPEG, quality 80, max 1 MB. Original file is not stored.
-**Rejected alternatives:**
-- Client-side compression (`browser-image-compression`): Reduces upload size but adds frontend JS bundle weight and makes server-side validation of the compressed result harder.
-- No compression: Claude's vision API accepts larger images, but enforcing a consistent size limit server-side keeps costs predictable.
-**Consequences:**
-- (+) Server controls quality and size; client sends original file without preprocessing.
-- (-) Sharp requires native binaries; must be available in the deployment environment.
-**Review trigger:** If deploying to an environment where Sharp native binaries are unavailable (e.g. some edge runtimes) — switch to client-side compression in that case.
+### Two local dev processes with a dev proxy
+**Status:** Accepted **Date:** 2026-06-24
+**Context:** Need the fastest inner loop for a course MVP.
+**Decision:** Run Angular dev server on `:4200` with `proxy.conf.json` forwarding `/api` to Spring Boot on `:8080`. No CORS in dev; no production packaging in scope.
+**Rejected alternatives:** *Docker Compose* (more setup); *single artifact / Spring serves Angular* (slower frontend rebuild loop).
+**Consequences:** (+) Fast, simple. (−) Production deployment undefined (out of MVP scope; revisit later).
+**Review trigger:** When a deployable/production build is required.
 
 ---
 
 ## 9. Diagrams
 
 ### 9.1 Architecture / Component Diagram
-
 ```mermaid
-graph TD
+flowchart LR
     subgraph Browser
-        F[Form Screen\nComplaintReturnForm\nImageUpload]
-        C[Chat Screen\nChatInterface\nuseChat hook]
+      UI[Angular SPA<br/>Material + ngx-markdown]
+      Intake[Intake form]
+      Chat[Custom chat + SSE]
+      UI --- Intake
+      UI --- Chat
     end
-
-    subgraph Next.js Server
-        AR[/api/analyse\nRoute Handler]
-        CR[/api/chat\nRoute Handler]
-        IMG[lib/compression/image.ts\nSharp]
-        MM[lib/llm/multimodal.ts\nImage Analysis]
-        AG[lib/llm/agent.ts\nDecision Agent]
-        PR[lib/procedures/loader.ts\nProcedure Docs]
-        PROM[lib/llm/prompts.ts\nPrompt Templates]
+    subgraph Backend[Spring Boot MVC :8080]
+      WEB[REST + SSE controllers]
+      APP[CaseService / ChatService]
+      LLM[LLM gateway openai-java]
+      SESS[(In-memory SessionStore)]
+      IMG[ImageCompressor]
+      POL[Policy loader]
+      WEB --> APP
+      APP --> LLM
+      APP --> SESS
+      APP --> IMG
+      APP --> POL
     end
-
-    subgraph Anthropic API
-        CL1[claude-sonnet-4-6\nVision]
-        CL2[claude-sonnet-4-6 + Extended Thinking\nReasoning]
-    end
-
-    subgraph Filesystem
-        CPD[docs/procedures/\ncomplaint-procedure.md\nreturn-procedure.md]
-    end
-
-    F -->|multipart POST| AR
-    AR --> IMG
-    IMG --> MM
-    AR --> PR
-    PR --> CPD
-    MM --> CL1
-    MM -->|ImageAnalysisResult| AG
-    AR --> AG
-    AG --> PR
-    AG --> PROM
-    AG --> CL2
-    AG -->|AgentDecision| AR
-    AR -->|JSON response| F
-    F -->|navigate + pass state| C
-    C -->|streaming POST| CR
-    CR --> PROM
-    CR --> CL2
-    CR -->|stream| C
+    OR[(OpenRouter<br/>Chat Completions)]
+    DOCS[[docs/policies/*.md]]
+    Intake -->|"POST /api/v1/cases (multipart)"| WEB
+    Chat -->|"POST .../messages (SSE)"| WEB
+    LLM -->|HTTPS| OR
+    POL -.loads.-> DOCS
 ```
 
 ### 9.2 Data Flow Diagram
-
 ```mermaid
-flowchart LR
-    U([Employee Browser]) -->|1. FormSubmission + image file| A[POST /api/analyse]
-    A -->|2. image buffer| S[Sharp compress\n→ JPEG ≤1MB]
-    S -->|3. base64 image + complaint prompt| M[Multimodal LLM\nclaude-sonnet-4-6]
-    M -->|4. ImageAnalysisResult JSON| AG[Thinking Agent\nclaude-sonnet-4-6 + thinking]
-    A -->|5. FormSubmission + procedure doc| AG
-    AG -->|6. AgentDecision JSON| A
-    A -->|7. {imageAnalysis, decision}| U
-    U -->|8. user message + system context| C[POST /api/chat]
-    C -->|9. streamed tokens| U
+flowchart TD
+    A[Form data + image] --> B[Backend validation]
+    B --> C[Compress image -> JPEG -> base64]
+    C --> D[Vision model: scenario image-analysis prompt]
+    D --> E[ImageAnalysis structured]
+    E --> F[Decision agent: scenario decision prompt + policy doc + form + analysis]
+    F --> G[DecisionResult structured: category + justification + nextSteps]
+    G --> H[Backend composes first message: greeting + decision + justification + nextSteps + disclaimer]
+    H --> I[Persist CaseSession in memory]
+    I --> J[Return sessionId + firstMessage to UI -> Chat screen]
+    J --> K[User follow-up message]
+    K --> L[Chat agent: full session context]
+    L -->|SSE token deltas| M[UI appends tokens to assistant bubble]
 ```
 
 ### 9.3 Sequence Diagrams
 
-#### Form Submission and Initial Decision (Happy Path)
-
+#### Form submission → analysis → decision (happy path)
 ```mermaid
 sequenceDiagram
-    actor E as Employee
-    participant F as Form Screen
-    participant API as /api/analyse
-    participant Sharp
-    participant MML as Multimodal LLM
-    participant Agent as Thinking Agent
-    participant FS as Procedure Files
+    participant U as Customer (Angular)
+    participant B as Backend (CaseService)
+    participant I as ImageCompressor
+    participant V as Vision model (OpenRouter)
+    participant D as Decision agent (OpenRouter)
+    participant S as SessionStore
+    U->>B: POST /api/v1/cases (type, category, model, date, reason, image)
+    B->>B: Validate (required, type/size, future date)
+    B->>I: Compress + downscale image
+    I-->>B: JPEG bytes
+    B->>V: Chat Completions (scenario image-analysis prompt + base64 image)
+    V-->>B: ImageAnalysis (structured)
+    B->>D: Chat Completions (scenario decision prompt + form + analysis + policy doc, structured output)
+    D-->>B: DecisionResult (category, justification, nextSteps)
+    B->>B: Compose first message (+ disclaimer)
+    B->>S: Save CaseSession
+    B-->>U: { sessionId, decision, firstMessage, caseSummary }
+    U->>U: Navigate form -> chat, render first message
+```
 
-    E->>F: Fill form + upload image
-    E->>F: Click "Wyślij zgłoszenie"
-    F->>F: Client-side Zod validation
-    alt Validation fails
-        F-->>E: Inline field error messages
-    else Validation passes
-        F->>API: POST multipart (form fields + image)
-        F-->>E: Show loading screen "Analizowanie zdjęcia..."
-        API->>Sharp: Compress image to ≤ 1MB JPEG
-        Sharp-->>API: Compressed image buffer
-        API->>MML: Image + typed prompt (complaint or return)
-        MML-->>API: ImageAnalysisResult JSON
-        alt Image unreadable
-            API-->>F: 422 + unreadable reason
-            F-->>E: Error: re-upload image (form retained)
-        else Image readable
-            F-->>E: Update status "Generowanie decyzji..."
-            API->>FS: Load procedure markdown
-            FS-->>API: Procedure text
-            API->>Agent: FormData + ImageAnalysisResult + procedure text
-            Agent-->>API: AgentDecision JSON
-            API-->>F: 200 {imageAnalysis, decision}
-            F->>F: Navigate to Chat Screen with state
-        end
+#### Follow-up chat (streaming)
+```mermaid
+sequenceDiagram
+    participant U as Customer (Angular)
+    participant B as Backend (ChatService)
+    participant S as SessionStore
+    participant C as Chat model (OpenRouter)
+    U->>B: POST /api/v1/cases/{id}/messages { message } (fetch + ReadableStream)
+    B->>S: Load session (404 if unknown)
+    B->>B: Append user message; build full context (form + analysis + decision + transcript)
+    B->>C: Chat Completions stream=true
+    loop token deltas
+      C-->>B: chunk
+      B-->>U: SSE data: token
     end
+    C-->>B: end
+    B->>S: Append assistant message
+    B-->>U: SSE event: done
 ```
 
-#### Chat Interaction (Streaming)
-
+#### Error path — upstream LLM unavailable
 ```mermaid
 sequenceDiagram
-    actor E as Employee
-    participant C as Chat Screen
-    participant API as /api/chat
-    participant Agent as Thinking Agent
-
-    C->>C: Mount with {formData, imageAnalysis, initialDecision}
-    C-->>E: Display first message (decision bubble)
-    E->>C: Type message + click Send
-    C->>API: POST {messages[], systemPrompt with context}
-    API->>Agent: streamText with full context
-    Agent-->>API: Token stream
-    API-->>C: SSE stream (Vercel AI SDK protocol)
-    C-->>E: Tokens rendered progressively in chat bubble
-    Agent-->>API: Stream complete
-    API-->>C: [DONE]
-    C-->>E: Final message displayed; input re-enabled
-```
-
-#### Error Path — LLM Timeout or API Failure
-
-```mermaid
-sequenceDiagram
-    actor E as Employee
-    participant F as Form Screen
-    participant API as /api/analyse
-
-    F->>API: POST multipart
-    F-->>E: Loading screen
-    API->>API: LLM call times out or returns 5xx
-    API-->>F: 503 {error: "service_unavailable"}
-    F-->>E: Error screen: "Nie udało się przetworzyć zgłoszenia.\nSpróbuj ponownie."
-    E->>F: Click "Spróbuj ponownie"
-    F-->>E: Re-show form with data retained
+    participant U as Customer (Angular)
+    participant B as Backend
+    participant V as OpenRouter
+    U->>B: POST /api/v1/cases (valid)
+    B->>V: image-analysis request
+    V-->>B: 5xx / timeout (after retry)
+    B-->>U: 502/503 { code: "LLM_UNAVAILABLE", message (Polish-safe) }
+    U->>U: Show non-technical error + Retry (form data preserved)
 ```
 
 ---
 
 ## 10. Testing Strategy
 
-See `docs/ADR/003-ai-agents.md` for AI-specific test scenarios.
-
 ### Philosophy
+TDD per `AGENTS.md`: write/extend tests from the spec before production code; tests are the agent's primary self-validation. The external LLM is the only thing mocked in integration tests; unit tests mock all dependencies; **E2E runs the real stack end-to-end with nothing mocked — including a live LLM call** (a stubbed E2E previously hid real bugs and is not used).
 
-TDD is the primary self-validation mechanism. Write tests before implementing each module. The separation between `lib/` (pure logic) and `app/` (Next.js routing) makes `lib/` fully testable without Next.js infrastructure.
-
-### Test Layers
+### Test layers
 
 | Layer | Type | Scope | Tools |
 |---|---|---|---|
-| Unit | Pure functions | `lib/validation/`, `lib/compression/`, `lib/procedures/`, `lib/llm/prompts.ts` | Vitest |
-| Integration | API routes with mocked LLM | `app/api/analyse`, `app/api/chat` | Vitest + `@ai-sdk/anthropic` mock |
-| Component | UI components | Form validation feedback, chat message rendering | Vitest + React Testing Library |
-| E2E | Full user journey | Form → Processing → Chat, all error paths | Playwright |
+| Unit (BE) | Fast, all deps mocked | Validation, image compression, session store, prompt assembly, message composition, error mapping | JUnit 5, Mockito, AssertJ |
+| Integration (BE) | Only external LLM mocked | Controller → service → LLM gateway with HTTP; multipart upload; SSE emission | Spring Boot Test, MockMvc, **WireMock** (stub OpenRouter) |
+| Unit (FE) | All deps mocked | Form validation logic, SSE parsing, signal state updates, markdown rendering wiring | Angular testing utilities (CLI default) |
+| E2E | Nothing mocked (real stack incl. live LLM) | Full form→decision→chat→reload-restore journey in a browser | Playwright (per qa-engineer) |
 
-### Key Test Scenarios
+### Key test scenarios
+- **Happy path return — eligible:** valid form (Zwrot) + clean photo → vision says no signs of use → decision `ELIGIBLE`; first message contains decision + disclaimer. Edge: purchase date exactly 14 days ago.
+- **Happy path complaint — defect:** valid form (Reklamacja, reason present) + damaged photo → decision reflects manufacturing-defect path. Edge: ambiguous cause → `NEEDS_HUMAN_REVIEW`.
+- **Validation failures:** missing required field; missing reason when Reklamacja; wrong file type (415); >10 MB (413); future purchase date (400). Each returns the specific error code and blocks submission.
+- **Insufficient evidence:** unclear photo / missing model → `MORE_INFO_REQUIRED` with `missingInfo` populated.
+- **Upstream failure:** OpenRouter 5xx/timeout → 502/503, non-technical message, no session leaked; client can retry with data preserved.
+- **Chat streaming:** follow-up returns incremental SSE tokens; assistant message accumulates; transcript saved.
+- **Unknown session:** chat to a non-existent `sessionId` → 404.
+- **Off-topic chat:** agent declines and redirects (assert behavior via stubbed LLM contract).
 
-| Scenario | Type | Input | Expected output |
-|---|---|---|---|
-| Form validation — missing image | Unit | `FormSubmission` without `imageFile` | Zod parse error on `imageFile` field |
-| Form validation — future purchase date | Unit | `purchaseDate` = tomorrow | Zod parse error on `purchaseDate` |
-| Form validation — complaint without reason | Unit | `requestType: "reklamacja"`, `complaintReason: undefined` | Zod parse error on `complaintReason` |
-| Image compression — large JPEG | Unit | 8 MB JPEG buffer | Output buffer ≤ 1 MB, MIME type `image/jpeg` |
-| Image compression — oversized WebP | Unit | 10 MB WebP buffer | Output buffer ≤ 1 MB |
-| Procedure loader — complaint | Unit | Filesystem mock with complaint-procedure.md | Returns full markdown string |
-| `/api/analyse` — happy path complaint | Integration | Valid multipart + mock LLM returning valid JSON | 200 with `AgentDecision` and `decision: "zaakceptowano"` |
-| `/api/analyse` — unreadable image | Integration | Valid multipart + mock LLM returning `status: "unreadable"` | 422 with `unreadableReason` |
-| `/api/analyse` — LLM timeout | Integration | Valid multipart + mock LLM throwing timeout error | 503 with `error: "service_unavailable"` |
-| `/api/chat` — streaming response | Integration | Valid messages array + mocked `streamText` | SSE stream with at least one chunk |
-| E2E — full complaint flow | E2E | Fill form, upload test JPEG, submit | Chat screen opens with decision bubble containing "Zaakceptowano" or "Odrzucono" |
-| E2E — image re-upload flow | E2E | Upload a non-equipment image (mocked unreadable response) | Error message on loading screen, form shown with image field highlighted |
-| E2E — off-topic chat message | E2E | Send "Jaka jest cena tego produktu?" in chat | Agent response does not answer the question; redirects to the case |
-
-### Technical Acceptance Criteria
-
-- **TAC-01**: `POST /api/analyse` returns HTTP 200 with a valid `AgentDecision` JSON body within 60 seconds for a valid 5 MB JPEG input.
-- **TAC-02**: `POST /api/analyse` returns HTTP 422 when the multimodal LLM returns `status: "unreadable"`.
-- **TAC-03**: `POST /api/analyse` returns HTTP 503 when the Anthropic API call throws a network error.
-- **TAC-04**: `POST /api/chat` returns a streaming response (Content-Type: `text/event-stream`) within 3 seconds of receiving a valid request.
-- **TAC-05**: The compressed image output from `lib/compression/image.ts` is always ≤ 1,048,576 bytes (1 MB) regardless of input size (up to 10 MB).
-- **TAC-06**: Form submission with a file > 10 MB is rejected client-side before any network request is made.
-- **TAC-07**: All `lib/` modules have ≥ 80% statement coverage measured by Vitest.
-- **TAC-08**: The Playwright E2E suite passes against a locally running `next dev` instance with mocked Anthropic API responses.
+### Technical acceptance criteria (complement PRD ACs)
+- **TAC-01:** `POST /api/v1/cases` rejects files with content type other than `image/jpeg|png|webp` with HTTP 415 and a specific code.
+- **TAC-02:** `POST /api/v1/cases` rejects images >10 MB with HTTP 413 before any LLM call.
+- **TAC-03:** A future `purchaseDate` yields HTTP 400 with a field-level error and no LLM call.
+- **TAC-04:** The decision is parsed into exactly one of the four enum categories; any other value from the model is treated as an error and mapped to `NEEDS_HUMAN_REVIEW`.
+- **TAC-05:** The composed first message always contains the mandatory disclaimer text, independent of model output.
+- **TAC-06:** The image is compressed/downscaled before the vision call (verified: outgoing payload smaller than input; long edge ≤ configured max).
+- **TAC-07:** The chat endpoint returns `Content-Type: text/event-stream` and emits ≥1 token event then a terminal `done` event for a successful turn.
+- **TAC-08:** When the LLM gateway throws after retries, the API returns 502/503 and no partial session is persisted in an inconsistent state.
+- **TAC-09:** No OpenRouter credential is ever present in any frontend bundle or API response.
+- **TAC-10:** Backend never calls OpenRouter's `/responses` endpoint (only `/chat/completions`).

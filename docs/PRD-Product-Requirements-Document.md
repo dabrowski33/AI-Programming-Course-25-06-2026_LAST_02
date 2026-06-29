@@ -1,273 +1,212 @@
 # PRD — Hardware Service Decision Copilot
 
+> Status: MVP / PoC. Built live during the JSystems "AI dla programistów" course (NBP edition).
+> This document describes **functionality, system behavior, UX and UI only**. Technology choices, data models, prompt source code, and test strategy belong in the ADR.
+
 ---
 
 ## 1. Executive Summary
 
-Hardware Service Decision Copilot is an MVP internal web application that supports customer support and hardware service employees in making consistent, rule-based decisions on electronics complaint and return requests. The system guides the employee through a structured form, uses a multimodal LLM to assess the equipment's physical condition from an uploaded image, and then presents a decision with justification via a conversational chat interface. This is a PoC/MVP; optional features (customer history, session persistence, RAG knowledge base) are explicitly deferred.
+Hardware Service Decision Copilot is a self-service web application that helps a **customer** find out, in minutes, whether their electronics **return** (14-day right of withdrawal) or **complaint** (rękojmia / gwarancja) is likely to be accepted. The customer fills a short form and uploads one photo of the device; the system analyzes the photo with a multimodal LLM, then a reasoning agent combines the photo analysis, the form data, and the company's published return/complaint policies to produce a **preliminary, advisory decision** with a clear justification. The decision is delivered as the first message in a chat, where the customer can ask follow-up questions.
+
+This is an MVP. The decision is **not binding** — it is an automated preliminary assessment, and uncertain or borderline cases are routed to human review.
 
 ---
 
 ## 2. Problem Statement
 
-Customer support and service employees currently handle complaint and return decisions inconsistently. Each agent applies personal judgment when interpreting company procedures, which leads to contradictory outcomes for similar cases, customer dissatisfaction, and compliance risk. Employees must manually cross-reference multiple procedure documents while simultaneously managing the customer interaction. There is no structured decision trail and no tool that enforces the company's own rules at the point of decision.
+When a customer wants to return a device or file a complaint about a faulty one, they cannot easily tell beforehand whether their case qualifies. The rules (14-day withdrawal window, condition requirements, statutory warranty scope, exclusions for user-caused damage) are spread across legal documents and store policies that are hard to read and apply to a specific situation. As a result:
+
+- Customers submit returns/complaints that are obviously ineligible, then wait days for a rejection.
+- Customers who actually qualify hesitate or give up because they are unsure.
+- Support staff spend time on triage questions and repetitive eligibility explanations.
+
+Today the customer's only options are to read dense policy pages, call/email support and wait, or simply ship the item and hope. There is no instant, case-specific, explained first answer.
 
 ---
 
 ## 3. Users / Personas
 
-### Persona A — Customer Support Agent (Pracownik Obsługi Klienta)
-Handles inbound complaint and return requests remotely (phone, email, in-person counter). Not technically specialised. Needs a fast, guided workflow to collect the required information and receive a clear, defensible decision without having to interpret policy documents themselves.
+### Persona A — "Anna", the returning customer (primary)
+Bought a device online, changed her mind, and wants to return it within the withdrawal window. She is not technical and not a lawyer. She wants a quick, plain-language answer: *"Can I return this, and what do I do next?"* She expects honesty about whether the item's condition (signs of use) disqualifies the return.
 
-### Persona B — Service Technician (Technik Serwisu)
-Physically receives equipment at the service point, assesses condition, and decides whether to accept a complaint or return. Has technical knowledge but needs procedural guidance to stay compliant with company rules, especially for edge cases.
+### Persona B — "Marek", the complaint customer (primary)
+His device developed a fault. He wants to file a complaint (reklamacja) and is worried it will be rejected as "his fault". He wants to understand whether the visible damage looks like a manufacturing defect or like accidental/user damage, and what evidence or next step is needed.
 
-### Persona C — Service Supervisor (Supervisor Serwisu) *(read-only reference persona — not an active system user in MVP)*
-May review completed decisions after the fact. Not an active system user in MVP; included to clarify what information must be present in the decision output to support later review.
+### Persona C — "Service triage reviewer" (secondary, indirect)
+A human support/service employee who receives the cases that the copilot flags as **Needs human review**. They are not a direct user of the MVP UI, but the product must produce output (decision category + justification + structured case data) that makes their later manual review faster. Building the full reviewer console is **out of scope** for the MVP.
 
 ---
 
 ## 4. Main Flows
 
-### 4.1 Happy Path — Complaint Accepted
+### 4.1 Happy path — Return, eligible
+1. Customer opens the app and lands on the intake **form**.
+2. Customer selects **Return**, picks an equipment category, enters model name, picks the purchase date, optionally writes a reason, and uploads one photo.
+3. Customer submits. The system validates inputs client-side and server-side.
+4. Backend compresses the image and sends it to the multimodal LLM using the **return image-analysis prompt** (goal: detect signs of use/damage, completeness, whether the unit looks resellable as new).
+5. Backend passes the image analysis + form data + the **return policy** document to the reasoning agent using the **return decision prompt**.
+6. Agent returns a decision category, a justification, and next steps.
+7. The app switches to the **chat** screen and renders the agent's first message: greeting, decision (**Eligible**), explanation referencing the photo and the policy, next steps, and the mandatory disclaimer.
+8. Customer asks a follow-up ("Do I pay return shipping?"); the agent answers using full context.
 
-1. Employee opens the application in a web browser.
-2. The form screen is displayed with an empty form.
-3. Employee selects **"Reklamacja"** (Complaint) from the request type dropdown.
-4. Employee selects the equipment category from the predefined list.
-5. Employee enters the equipment name/model in the text field.
-6. Employee selects the purchase date using the date picker.
-7. Employee enters a description of the fault in the complaint reason textarea (obligatory for complaints).
-8. Employee uploads one image of the equipment.
-9. Employee clicks **"Wyślij"** (Submit).
-10. The system validates all fields; if valid, displays a processing/loading screen.
-11. Backend receives form data and image; compresses image before forwarding.
-12. Backend sends compressed image to the multimodal LLM with the complaint-specific analysis prompt.
-13. Multimodal LLM returns a structured description of the equipment's visible condition and damage type.
-14. Backend sends the image description, form data, and complaint procedure document to the thinking LLM agent.
-15. Agent evaluates all inputs against the complaint procedure rules and produces a decision.
-16. Chat interface opens. The first message from the agent is displayed, containing: greeting, decision result (**Zaakceptowano**), justification referencing specific procedure rules, and next steps for the employee.
-17. Employee may ask follow-up questions or provide additional context in the chat input.
-18. Agent responds with full conversational context (form data + image description + prior messages) maintained throughout the session.
+### 4.2 Happy path — Complaint, defect detected
+1–3. As above, but customer selects **Complaint**; the reason textarea is **required**.
+4. Backend sends the photo with the **complaint image-analysis prompt** (goal: identify visible damage, its type, and the most likely cause — manufacturing defect vs. accidental/user-caused vs. wear).
+5. Backend passes the analysis + form + **complaint policy** to the agent using the **complaint decision prompt**.
+6–8. Agent returns the decision and justification; chat opens with the first message; customer can continue the conversation.
 
-### 4.2 Happy Path — Return Accepted
+### 4.3 Alternative — Not eligible
+- Return where the photo shows clear signs of use, or the purchase date is outside the 14-day window → decision **Not eligible**, with the specific disqualifying reason and the disclaimer that the customer may still escalate to a human.
 
-Steps 1–9 identical to 4.1, with the following differences:
-- Employee selects **"Zwrot"** (Return) at step 3.
-- Complaint reason textarea is optional for returns.
-- At step 12, backend uses the return-specific image analysis prompt (assessing whether the item shows signs of use and is resalable).
-- At step 14, backend uses the return procedure document and return-specific agent prompt.
-- Decision in step 16 is **Zaakceptowano** with justification that item shows no signs of use and meets return criteria.
+### 4.4 Alternative — Needs human review
+- Borderline or conflicting evidence (e.g. photo inconclusive, damage cause ambiguous, policy edge case) → decision **Needs human review**. The agent explains why it cannot decide and what a human will check.
 
-### 4.3 Alternative Path — Request Rejected
+### 4.5 Alternative — More info required
+- The provided data/photo is insufficient (e.g. photo does not show the relevant part, missing model, vague reason) → decision **More info required**, listing exactly what is missing. The customer can supply it in chat.
 
-Identical to 4.1 or 4.2 until step 15. Agent produces a **Odrzucono** decision. First chat message includes: rejection decision, specific rule(s) that the case fails to meet, explanation of which condition was not fulfilled (e.g. purchase date exceeds return window, damage is user-caused), and what options remain available to the customer.
-
-### 4.4 Alternative Path — Requires Additional Information
-
-Agent produces a **Wymaga weryfikacji** result when the image is ambiguous or the form data is insufficient to make a definitive determination. First chat message explains what specific information or additional evidence is needed. Employee uses the chat to provide clarification or upload description of additional observations.
-
-### 4.5 Alternative Path — Image Unreadable or Irrelevant
-
-After step 11, multimodal LLM returns a result indicating the image does not show the equipment clearly or is unrelated to the equipment. System displays an error within the loading screen (does not open chat) and prompts the employee to re-upload a suitable image. The form data is retained. The employee re-uploads and resubmits.
-
-### 4.6 Alternative Path — Form Validation Failure
-
-At step 10, one or more required fields are missing or invalid (e.g. future purchase date, no image, missing complaint reason for a complaint). System highlights the failing fields inline with error messages. Employee corrects and resubmits. No backend call is made until all validations pass.
+### 4.6 Error paths
+- **Validation error**: missing required field, wrong file type, oversized file, or future purchase date → inline error, no submission.
+- **Image analysis / agent service unavailable**: the system shows a non-technical error message and lets the customer retry without re-entering the form.
+- **Off-topic chat**: the agent declines and steers back to the return/complaint case.
 
 ---
 
 ## 5. User Stories
 
-**US-01** — As a Customer Support Agent, I want to submit a structured form with equipment details and a photo so that I have a consistent, documented starting point for every case.
-
-**US-02** — As a Service Technician, I want to receive an AI-generated decision with a clear justification immediately after submitting the form so that I can process the case quickly without reading the full procedure document.
-
-**US-03** — As a Customer Support Agent, I want to continue the conversation with the agent after the initial decision so that I can provide additional context and receive an updated assessment without starting over.
-
-**US-04** — As a Service Technician, I want the agent to explicitly cite which rule or procedure clause its decision is based on so that I can explain the decision to the customer confidently.
-
-**US-05** — As a Customer Support Agent, I want the system to tell me clearly what to do next after each decision (accepted / rejected / escalate) so that I do not have to consult a separate procedure.
-
-**US-06** — As a Customer Support Agent, I want the system to warn me if the uploaded image does not clearly show the equipment so that I can request a better photo before proceeding.
-
-**US-07** — As a Service Technician, I want the form to prevent me from submitting a purchase date in the future so that I avoid data entry errors.
-
-**US-08** — As a Customer Support Agent, I want the agent to stay on topic and redirect me if I ask it questions unrelated to the complaint or return case so that the session remains focused.
+1. **(Happy — return)** As a returning customer, I want to submit my device details and a photo and get an instant eligibility answer, so that I know whether to ship it back before wasting time.
+2. **(Happy — complaint)** As a complaint customer, I want the system to assess my photo and tell me if the damage looks like a covered defect, so that I understand my chances and next steps.
+3. **(Chat follow-up)** As a customer, I want to ask follow-up questions after the decision, so that I can clarify shipping, timelines, or what evidence to add, without starting over.
+4. **(Invalid input)** As a customer, I want clear inline messages when my file is the wrong type/too large or a required field is empty, so that I can fix it immediately.
+5. **(Service down)** As a customer, I want a friendly error and a retry option when the AI service is unavailable, so that I don't lose the data I already entered.
+6. **(Ambiguous case)** As a customer, I want the system to tell me honestly when it can't decide and that a human will review, so that I'm not given a false verdict.
+7. **(Insufficient evidence)** As a customer, I want to be told exactly what extra information or photo is needed, so that I can complete my case in the chat.
+8. **(Trust / disclaimer)** As a customer, I want every decision to clearly state it is preliminary and not binding, so that I understand a human makes the final call.
 
 ---
 
 ## 6. Acceptance Criteria
 
 ### Form
+- **AC-01** The form presents a **Type** selector with exactly two options: *Reklamacja (Complaint)* and *Zwrot (Return)*.
+- **AC-02** The form presents an **equipment category** selector populated from a fixed predefined list (see §8 Functional).
+- **AC-03** The form provides a free-text **model/name** input (required).
+- **AC-04** The form provides a **date of purchase** picker that rejects future dates.
+- **AC-05** The form provides a **reason** textarea that is **required when Type = Complaint** and optional when Type = Return.
+- **AC-06** The form requires **exactly one image** upload; submission is blocked without it.
+- **AC-07** The image upload accepts only JPEG, PNG, and WebP and rejects files larger than **10 MB** before compression, returning a specific error message for each violation.
+- **AC-08** All required-field, file-type, file-size, and future-date violations are shown inline and prevent submission.
+- **AC-09** All form labels, options, helper text, and error messages are in **Polish**.
 
-**AC-01** — The request type field displays exactly two options: "Reklamacja" and "Zwrot".
+### Image Analysis
+- **AC-10** On submit, the backend compresses/downscales the image before sending it to the multimodal LLM.
+- **AC-11** The system uses a **different image-analysis prompt** for Complaint vs. Return.
+- **AC-12** For Return, the image analysis reports presence/absence of signs of use, damage, completeness, and resellable-as-new assessment.
+- **AC-13** For Complaint, the image analysis reports visible damage, damage type, and most likely cause (manufacturing defect / accidental or user-caused / normal wear).
 
-**AC-02** — The equipment category field is a predefined dropdown. Submission fails if no category is selected.
+### AI Decision
+- **AC-14** The agent uses a **different decision prompt** for Complaint vs. Return.
+- **AC-15** The agent's decision is exactly one of four categories: **Eligible**, **Not eligible**, **Needs human review**, **More info required**.
+- **AC-16** The decision is produced from the combination of: form data, image analysis output, and the corresponding policy document (complaint policy or return policy).
+- **AC-17** Every decision includes a justification that references the concrete reasons (condition/photo findings and the applicable policy rule).
+- **AC-18** When evidence is insufficient or contradictory, the agent must return **Needs human review** or **More info required** and must not assert a definitive Eligible/Not eligible verdict.
+- **AC-19** The agent never invents policy rules, prices, dates, or facts not present in the inputs or policy documents.
 
-**AC-03** — The equipment name/model field accepts free text up to 200 characters. Submission fails if empty.
-
-**AC-04** — The purchase date field is a date picker. Submission fails if the date is in the future or if no date is selected.
-
-**AC-05** — The complaint reason textarea is mandatory when request type is "Reklamacja". Submission fails if empty in that case. It is optional when request type is "Zwrot". Maximum 2000 characters.
-
-**AC-06** — The image upload field accepts JPG, PNG, and WebP formats only. Submission fails if no image is uploaded, if the file format is not accepted, or if the file size exceeds 10 MB before compression.
-
-**AC-07** — On submission failure, each failing field is highlighted with a specific inline error message. The form retains all previously entered values.
-
-**AC-08** — The submit button is disabled and shows a loading indicator while a submission is being processed. It cannot be clicked twice.
-
-### Image Processing
-
-**AC-09** — Backend compresses the uploaded image to a maximum of 1 MB before forwarding it to the multimodal LLM. The original file is not stored in MVP.
-
-**AC-10** — If the multimodal LLM returns a result indicating the image is unreadable or does not show the equipment, the system returns the user to the form with an error message specifying the problem. The form data is retained.
-
-### AI Analysis — Complaint Scenario
-
-**AC-11** — The multimodal LLM prompt for complaints instructs the model to assess: whether damage is visible, the type and extent of damage, and the likely cause (user-caused vs. manufacturing defect vs. normal wear).
-
-**AC-12** — The thinking agent for complaints evaluates the image description and form data against the complaint procedure rules and returns one of three decisions: "Zaakceptowano", "Odrzucono", or "Wymaga weryfikacji".
-
-**AC-13** — Every agent decision includes a reference to the specific rule(s) from the complaint procedure document that the decision is based on.
-
-### AI Analysis — Return Scenario
-
-**AC-14** — The multimodal LLM prompt for returns instructs the model to assess: whether the item shows visible signs of use, whether it appears to be in resalable condition, and whether any damage is present.
-
-**AC-15** — The thinking agent for returns evaluates the image description and form data against the return procedure rules and returns one of three decisions: "Zaakceptowano", "Odrzucono", or "Wymaga weryfikacji".
-
-**AC-16** — Every agent decision for returns includes a reference to the specific rule(s) from the return procedure document that the decision is based on.
-
-### Chat Interface
-
-**AC-17** — The chat interface opens only after a successful agent decision is produced. It never opens if image processing or agent evaluation fails.
-
-**AC-18** — The first message in the chat is from the system/agent and contains: a greeting, the decision result (Zaakceptowano / Odrzucono / Wymaga weryfikacji), a justification with rule references, and clearly stated next steps.
-
-**AC-19** — The first message is formatted with distinct visual sections for: decision result, justification, and next steps. Plain prose for the remaining chat messages.
-
-**AC-20** — The agent retains the full session context throughout the conversation: form data, image description, and all prior messages. Responses are consistent with this context.
-
-**AC-21** — When the user asks a question unrelated to the current complaint or return case, the agent responds politely, declines to answer the off-topic question, and redirects the conversation to the case at hand.
-
-**AC-22** — When the user provides additional information in chat that contradicts the image analysis result, the agent explicitly acknowledges the contradiction and states which source (image vs. user input) it is weighting and why.
-
-**AC-23** — The chat input field is disabled while the agent is generating a response. A loading indicator is shown.
+### Chat
+- **AC-20** After a successful decision, the UI transitions from form to chat and renders the agent's **first message** containing: greeting, decision category, explanation, next steps, and the disclaimer — formatted for readability.
+- **AC-21** The agent has access to the full context (form data, image analysis, first decision message) for all subsequent turns.
+- **AC-22** The customer can send follow-up messages and receives context-aware answers.
+- **AC-23** Off-topic requests are declined and redirected to the return/complaint topic.
+- **AC-24** Every decision message includes the mandatory disclaimer that the assessment is preliminary, automated, and not binding (see §11).
 
 ### General
-
-**AC-24** — All user-facing text in the interface is in Polish.
-
-**AC-25** — The application loads and the form is interactive within 3 seconds on a standard office network connection.
-
-**AC-26** — If the AI backend (multimodal LLM or thinking agent) returns an error or times out, the system displays a user-facing error message in Polish and offers the option to retry the submission.
+- **AC-25** All customer-facing text (form, chat, decisions, errors, disclaimers) is in **Polish**.
+- **AC-26** If the image-analysis or agent service fails, the customer sees a non-technical error and can retry without re-entering form data.
+- **AC-27** The decision output is structured enough (category + justification + case data) to hand a **Needs human review** case to a human later.
 
 ---
 
 ## 7. Out of Scope
 
-**Authentication and authorisation** — No login, no user accounts, no role-based access control in MVP. The application is assumed to be deployed on an internal network accessible only to employees.
+The following are explicitly **NOT** part of the MVP. Several are planned for later (see §12 Backlog) and the architecture should not preclude them.
 
-**Customer identity and purchase history** — No retrieval of customer data. No integration with any CRM, ERP, or SQLite customer database. The employee enters all case data manually.
-
-**Session persistence and audit log** — No saving of sessions, decisions, or conversation history to a database. Each browser session is independent and ephemeral.
-
-**Multiple image upload** — Only one image per case is supported. Additional images during chat are not supported.
-
-**RAG knowledge base** — No vector database or retrieval-augmented generation over an electronics knowledge base.
-
-**Supervisor / admin panel** — No UI for reviewing past decisions, overriding decisions, or managing procedure documents.
-
-**Email or notification dispatch** — No automated emails, SMS, or push notifications.
-
-**Mobile application** — Web browser only. No native iOS or Android app.
-
-**Multi-language support** — Polish only. No language selector.
-
-**Reporting and analytics** — No dashboards, statistics, or export functions.
-
-**Customer-facing interface** — The system is for internal employee use only. Customers do not interact with it directly.
+- **Authentication / user accounts** — no login, no identity verification.
+- **Customer & purchase-history lookup** — no retrieval of existing customer records or order history from any database in the MVP. *(Planned — Backlog.)*
+- ~~**Session/decision persistence to a database** — no durable storage of sessions, decisions, or audit trail in the MVP.~~ *(Delivered post-MVP: sessions, form data, image analysis, decision, and chat transcript are now persisted durably in an embedded **H2** database — see `docs/ADR/004-persistence.md`. The uploaded image itself is still not stored — see Backlog.)*
+- **Agent RAG knowledge base** — no retrieval over an internal electronics/specs/procedures knowledge base beyond the two policy documents injected into the prompt. *(Planned — Backlog.)*
+- **Human reviewer console / admin UI** — no back-office screen for triage reviewers.
+- **Multiple image upload / video** — exactly one image; no video, no document attachments.
+- **Notifications** — no email/SMS/push to the customer or staff.
+- **Payments, shipping label generation, RMA issuance** — the app advises; it does not execute the return/complaint transaction.
+- **Multilingual UI** — Polish only.
+- **Native mobile apps** — responsive web only.
+- **Editing/withdrawing a submitted case** — once submitted, the case proceeds to chat; no case management.
+- **Final/binding decisions** — the system is advisory only.
 
 ---
 
 ## 8. Constraints
 
 ### Business
-
-- Decisions produced by the agent are recommendations to the employee, not final automated decisions. The employee retains responsibility for the outcome.
-- The agent must base every decision on the company procedure documents provided. It must not invent rules or reference policies not in the injected documents.
-- The agent must include a disclaimer in each decision message that the recommendation is AI-generated and should be reviewed by the employee before communicating to the customer.
+- The decision is **advisory and non-binding**; the company retains the right to make the final determination through human review.
+- The product must align with **Polish consumer law**: the 14-day right of withdrawal for distance sales (return) and statutory warranty (rękojmia) / manufacturer guarantee (gwarancja) for complaints.
+- Every decision must carry a disclaimer stating it is a preliminary automated assessment (see §11).
+- The agent must not provide individualized binding legal advice; it explains policy as published.
 
 ### Functional
+- **Image**: exactly one file; formats JPEG, PNG, WebP; max **10 MB** pre-compression; backend compresses/downscales before LLM submission.
+- **Equipment categories (predefined list)**: Smartfony i telefony; Laptopy i komputery; Tablety; Telewizory i monitory; Audio (słuchawki, głośniki); Konsole i gaming; Smartwatche i wearables; Aparaty i fotografia; Małe AGD; Akcesoria (ładowarki, kable, etui); Inne.
+- **Type options (predefined list)**: Reklamacja (Complaint); Zwrot (Return).
+- **Purchase date**: cannot be in the future.
+- **Reason**: required for Complaint, optional for Return.
+- **Language**: all user-facing text in Polish.
+- **Platform**: responsive web (desktop + mobile browsers). Sessions are persisted durably (ADR-004), so a case can be reopened by its URL; there are still no user accounts (any holder of the `sessionId` URL can view the case).
 
-- Request type: exactly 2 options — "Reklamacja", "Zwrot".
-- Equipment categories (predefined list): Laptopy i komputery, Smartfony i telefony, Tablety, Konsole do gier, Sprzęt audio (słuchawki, głośniki), Telewizory i monitory, Małe AGD, Akcesoria (ładowarki, kable, inne).
-- Image upload: JPG, PNG, WebP only. Max 10 MB before compression. One image per submission.
-- Backend compresses image to ≤ 1 MB before sending to multimodal LLM.
-- Complaint reason: max 2000 characters. Required for "Reklamacja", optional for "Zwrot".
-- Equipment name/model: max 200 characters, free text.
-- Purchase date: must not be in the future. No constraint on how far in the past.
-- Agent decision values: exactly three — "Zaakceptowano", "Odrzucono", "Wymaga weryfikacji".
-- All user-facing text in Polish. Procedure documents and internal prompts may be in Polish or English (decided in ADR).
+### External document / data references
 
-### External Document / Data References
+These starter policy documents are created with the MVP and injected into the agent's prompt as the rules to follow. They are examples to be reviewed/replaced by the business.
 
-| Document | File Path | When Used |
+| Document | File path | When it is used |
 |---|---|---|
-| Complaint Procedure | `docs/procedures/complaint-procedure.md` | Injected into the thinking agent prompt for "Reklamacja" cases |
-| Return Procedure | `docs/procedures/return-procedure.md` | Injected into the thinking agent prompt for "Zwrot" cases |
+| Polityka zwrotów (Return policy) | `docs/policies/polityka-zwrotow.md` | Injected into the agent's **return decision prompt** when Type = Zwrot |
+| Polityka reklamacji (Complaint policy) | `docs/policies/polityka-reklamacji.md` | Injected into the agent's **complaint decision prompt** when Type = Reklamacja |
 
 ---
 
-## 9. UI Description (Wireframe Level)
+## 9. UI Description (wireframe level)
 
-### Screen 1 — Form
+### 9.1 Screen 1 — Intake form
+**Layout (top to bottom):**
+- Short title and one-line explanation of what the tool does.
+- **Type** selector (Reklamacja / Zwrot) — the first and primary choice; changing it adjusts whether Reason is required.
+- **Equipment category** selector (dropdown from the predefined list).
+- **Model / name** text input.
+- **Date of purchase** date picker (future dates disabled).
+- **Reason** textarea (marked required when Complaint is selected; optional label when Return).
+- **Image upload** control: single-file picker / drag-and-drop, with a thumbnail preview once selected and a way to replace it. Helper text states accepted formats and the 10 MB limit.
+- **Submit** button.
 
-**Layout**: Single-column form, centred, max-width ~640px. Application title and logo at the top. Form fields stacked vertically with visible labels above each field. Single primary action button at the bottom.
+**States:**
+- *Empty*: submit disabled or, on click, surfaces inline validation.
+- *Validation error*: per-field inline messages (required, wrong type, too large, future date).
+- *Submitting / loading*: submit shows a busy state; the form is locked while the image is analyzed and the decision is generated; a progress indication communicates that the photo is being analyzed.
+- *Error*: a non-technical error banner with a **Retry** action that preserves entered data.
 
-**Fields (top to bottom)**:
-- **Typ zgłoszenia** — dropdown, required. Options: "Reklamacja", "Zwrot". Default: placeholder "Wybierz typ zgłoszenia".
-- **Kategoria sprzętu** — dropdown, required. Options: predefined list (see Section 8). Default: placeholder "Wybierz kategorię".
-- **Nazwa / Model sprzętu** — single-line text input, required. Placeholder: "np. Samsung Galaxy S23".
-- **Data zakupu** — date picker, required. No future dates selectable.
-- **Opis reklamacji / powód zwrotu** — textarea, required for "Reklamacja", labelled "Opis usterki lub powodu reklamacji" / "Powód zwrotu (opcjonalnie)". Label and required state change dynamically based on the request type selection. Max 2000 characters with a visible character counter.
-- **Zdjęcie sprzętu** — file upload component. Accepts JPG, PNG, WebP. Displays file name and thumbnail preview after selection. Shows accepted formats and max size hint. Required.
+### 9.2 Screen 2 — Chat
+**Layout:**
+- A scrollable conversation area. The **first message** is the agent's decision bubble: greeting → decision category (visually distinct/highlighted) → explanation → next steps → disclaimer footer.
+- A compact, read-only summary of the submitted case (type, category, model, purchase date) and the uploaded photo thumbnail, visible for context.
+- A message input with a send button at the bottom.
 
-**Error states**: Each field shows a red border and an inline error message directly below it when validation fails on submit attempt.
+**States:**
+- *Initial*: only the agent's decision message is present.
+- *Agent typing/loading*: a pending indicator while the agent responds.
+- *Conversation*: alternating customer and agent bubbles; full history retained for the session.
+- *Off-topic*: the agent's bubble politely declines and redirects.
+- *Error*: if a follow-up fails, an inline error with retry; the prior conversation is preserved.
 
-**Submit button**: "Wyślij zgłoszenie" — full width, primary colour. Disabled and shows spinner while submitting.
-
-**Empty state**: All fields empty on first load.
-
-### Screen 2 — Processing
-
-**Layout**: Centred, full-screen overlay or replacement of the form. Displays a loading spinner with a short status message.
-
-**Status messages** (sequential, displayed as processing progresses):
-1. "Analizowanie zdjęcia…"
-2. "Generowanie decyzji…"
-
-**Error state**: If processing fails (LLM error, timeout), the spinner is replaced by an error message in Polish with a "Spróbuj ponownie" (Retry) button that returns the user to the pre-filled form. If the image was deemed unreadable, the message specifies this and the form is shown with the image field highlighted.
-
-### Screen 3 — Chat Interface
-
-**Layout**: Full-height chat window. Message list occupies the main area with auto-scroll to newest message. Fixed input bar at the bottom.
-
-**First message (system)**: Displayed as a chat bubble aligned to the left, visually distinct from subsequent messages (e.g. slightly different background). Content structure:
-- Line 1: Greeting ("Dzień dobry, oto wynik analizy zgłoszenia.")
-- Block: **Decyzja**: [Zaakceptowano / Odrzucono / Wymaga weryfikacji] — visually highlighted (badge or bold label).
-- Block: **Uzasadnienie**: narrative explanation referencing specific procedure rules.
-- Block: **Kolejne kroki**: numbered list of what the employee should do next.
-- Block: Disclaimer (small text): "Decyzja została wygenerowana automatycznie przez system AI. Pracownik jest odpowiedzialny za ostateczną weryfikację przed przekazaniem informacji klientowi."
-
-**Subsequent messages**: Standard chat bubbles. Employee messages aligned right, agent messages aligned left.
-
-**Loading state**: While agent is responding, a typing indicator (three dots animation) appears in the agent bubble position.
-
-**Input bar**: Textarea (single-line, expands to multi-line), send button. Disabled while agent is responding.
-
-**No navigation back to form** from the chat screen. The session is complete once the chat opens. A "Nowe zgłoszenie" (New case) button is visible in the header to start a fresh form session.
+### 9.3 Navigation
+- Single forward transition: **form → chat** on a successful decision. No back-to-form editing in the MVP. Refreshing or reopening the chat URL **restores the session** (form-data header, decision, and full transcript) from durable storage (ADR-004).
 
 ---
 
@@ -275,108 +214,102 @@ At step 10, one or more required fields are missing or invalid (e.g. future purc
 
 ```mermaid
 flowchart TD
-    A([Pracownik otwiera aplikację]) --> B[Ekran: Formularz]
-    B --> C{Walidacja formularza}
-    C -- Błędy walidacji --> D[Wyróżnienie błędnych pól\ninline error messages]
-    D --> B
-    C -- Poprawny --> E[Ekran: Przetwarzanie\nAnalizowanie zdjęcia...]
-    E --> F{Multimodal LLM\nanaliza zdjęcia}
-    F -- Zdjęcie nieczytelne\nlub niezwiązane ze sprzętem --> G[Błąd: prośba o nowe zdjęcie\nFormularz zachowany]
-    G --> B
-    F -- Opis warunków zdjęcia --> H{Thinking Agent\nOcena wg procedur}
-    H -- Błąd API / timeout --> I[Ekran błędu\nPrzycisk: Spróbuj ponownie]
-    I --> E
-    H -- Decyzja wygenerowana --> J[Ekran: Czat\nPierwsza wiadomość z decyzją]
-    J --> K{Typ decyzji}
-    K -- Zaakceptowano --> L[Next steps: akceptacja\nPracownik kontynuuje]
-    K -- Odrzucono --> M[Next steps: odrzucenie\nwyjaśnienie reguły]
-    K -- Wymaga weryfikacji --> N[Next steps: eskalacja\nlub podanie dodatkowych danych]
-    L --> O{Pracownik kontynuuje czat?}
-    M --> O
-    N --> O
-    O -- Tak: dodatkowe pytanie\nlub nowe informacje --> P[Agent odpowiada\nz pełnym kontekstem sesji]
-    P --> O
-    O -- Nie: koniec sesji --> Q[Przycisk: Nowe zgłoszenie]
-    Q --> B
-
-    style J fill:#d4edda,stroke:#28a745
-    style G fill:#f8d7da,stroke:#dc3545
-    style I fill:#f8d7da,stroke:#dc3545
-    style D fill:#fff3cd,stroke:#ffc107
+    A[Open app: Intake form] --> B{Type?}
+    B -->|Complaint| C[Reason required]
+    B -->|Return| D[Reason optional]
+    C --> E[Fill category, model, date, upload 1 image]
+    D --> E
+    E --> F{Client + server validation}
+    F -->|Invalid: missing field / wrong type / >10MB / future date| G[Inline error, stay on form]
+    G --> E
+    F -->|Valid| H[Backend compresses image]
+    H --> I{Type?}
+    I -->|Complaint| J[Multimodal LLM: complaint image-analysis prompt]
+    I -->|Return| K[Multimodal LLM: return image-analysis prompt]
+    J --> L{Service available?}
+    K --> L
+    L -->|No| M[Non-technical error + Retry, data preserved]
+    M --> E
+    L -->|Yes| N[Agent: decision prompt + form + image analysis + policy doc]
+    N --> O{Decision category}
+    O -->|Eligible| P[Chat: first message - greeting, decision, explanation, next steps, disclaimer]
+    O -->|Not eligible| P
+    O -->|Needs human review| P
+    O -->|More info required| P
+    P --> Q[Customer sends follow-up]
+    Q --> R{On-topic?}
+    R -->|Yes| S[Agent answers with full context]
+    R -->|No| T[Agent declines, redirects to case]
+    S --> Q
+    T --> Q
 ```
 
 ---
 
 ## 11. Agent / System Behavior Specification
 
-### 11.1 Multimodal LLM — Image Analysis Agent
+### 11.1 Components
+1. **Multimodal image analyzer** — receives the compressed photo and produces a structured visual assessment. Uses **two distinct prompts**:
+   - *Return prompt*: assess signs of use/wear, any damage, completeness, and whether the unit appears resellable as new.
+   - *Complaint prompt*: identify visible damage, classify damage type, and estimate the most likely cause (manufacturing defect / accidental or user-caused / normal wear).
+2. **Decision agent** (reasoning LLM) — receives form data + image analysis + the relevant policy document and produces the decision. Uses **two distinct prompts** (return decision prompt / complaint decision prompt).
+3. **Conversational agent** — same agent continuing in chat with full session context.
 
-**Role**: Analyses the uploaded image and returns a structured description of the equipment's visible physical condition. Does not make a complaint/return decision.
+### 11.2 Role and purpose
+Help the customer understand whether their return or complaint is likely eligible, explain why in plain Polish, and state the next steps — strictly within the published policies.
 
-**Complaint prompt objective**: Determine (a) whether damage is visible, (b) the type and location of damage (e.g. cracked screen, dented casing, liquid damage indicators), (c) likely cause of damage (user-caused, manufacturing defect, normal wear and tear), (d) severity assessment.
+### 11.3 Allowed
+- Produce one of four decision categories with a justification grounded in the photo analysis and the policy document.
+- Ask for specific missing information.
+- Explain the applicable policy rules and the next steps.
+- Answer on-topic follow-up questions using the full context.
 
-**Return prompt objective**: Determine (a) whether the item shows visible signs of use (scratches, worn surfaces, missing components, markings), (b) whether the item appears to be in a condition suitable for resale as new or like-new, (c) presence of any damage.
+### 11.4 Not allowed
+- Must **not** issue a binding/final decision.
+- Must **not** invent rules, prices, deadlines, model specifications, or facts not present in the inputs or policy documents.
+- Must **not** give individualized binding legal advice or guarantee an outcome.
+- Must **not** force an Eligible/Not eligible verdict when evidence is insufficient or contradictory — it must escalate (Needs human review) or request data (More info required).
+- Must **not** answer off-topic requests; it redirects to the case.
 
-**Not allowed to**:
-- Make the final complaint/return decision.
-- Reference company procedures.
-- Output anything other than a structured condition description.
+### 11.5 Decision categories and how each is communicated
+- **Eligible** — case appears to meet policy. Communicate the positive preliminary result and concrete next steps.
+- **Not eligible** — a specific policy condition is not met (e.g. visible signs of use for a return; out of withdrawal window; damage assessed as user-caused for a complaint). State the precise disqualifying reason and that the customer may still request human review.
+- **Needs human review** — borderline/ambiguous; explain what is uncertain and that a human will verify.
+- **More info required** — input insufficient; list exactly what to provide; invite the customer to supply it in chat.
 
-**On unreadable image**: Returns a structured response with status `UNREADABLE` and a reason (e.g. "image too dark", "equipment not visible", "image does not show the claimed device"). The backend interprets this status and does not forward to the thinking agent.
+### 11.6 Mandatory disclaimer
+Every decision message must include a disclaimer in Polish stating that the assessment is a **preliminary, automated evaluation, not a binding decision**, and that the final determination is made by a human consultant. Example wording (Polish, customer-facing):
 
-### 11.2 Thinking LLM — Decision Agent
+> *„To wstępna, automatyczna ocena Twojego zgłoszenia, a nie wiążąca decyzja. Ostateczną decyzję podejmuje konsultant po weryfikacji zgłoszenia."*
 
-**Role**: Acts as a decision-support assistant. Evaluates the case against the relevant company procedure document and produces a decision with justification.
+### 11.7 Off-topic handling
+Politely decline and steer back to the return/complaint case in one short sentence; do not engage with unrelated topics.
 
-**Inputs available in context**:
-- Request type (Reklamacja / Zwrot)
-- Equipment category and model
-- Purchase date
-- Complaint reason / return reason (if provided)
-- Structured image description from multimodal LLM
-- Full text of the relevant procedure document (complaint or return)
-- Full conversation history after the first decision message
-
-**Decision values**: Exactly three — "Zaakceptowano", "Odrzucono", "Wymaga weryfikacji".
-
-**Allowed to**:
-- Reference and quote specific rules from the injected procedure document.
-- Ask the employee for additional information via the chat.
-- Adjust its assessment if the employee provides new information in the chat.
-- Flag contradictions between the image analysis and the employee's description.
-
-**Not allowed to**:
-- Invent rules, policies, or warranty terms not present in the injected procedure document.
-- Provide legal advice.
-- Contact external systems.
-- Discuss topics unrelated to the current complaint or return case (e.g. general product questions, pricing, other customers).
-- Produce a final decision without citing the specific procedure rule(s) it is applying.
-
-**Contradiction handling**: If the image analysis suggests user-caused damage but the employee states otherwise, the agent explicitly names the contradiction in its response, explains which evidence it is weighting more heavily and why, and may issue a "Wymaga weryfikacji" decision pending supervisor review.
-
-**Off-topic handling**: Agent responds briefly in Polish, declines to engage with the off-topic question, and redirects: "To zgłoszenie dotyczy [typ zgłoszenia] sprzętu [model]. Czy mogę pomóc w kwestiach związanych z tą sprawą?"
-
-**Mandatory disclaimer**: Every first decision message must include the AI-generated disclaimer as specified in Section 9, Screen 3.
-
-**Language**: All agent responses in Polish.
+### 11.8 Language and tone
+- Language: **Polish**, plain and accessible (no legalese where avoidable).
+- Tone: polite, warm, honest; clear even when delivering a negative outcome.
+- Formatting: the first message is structured (greeting, decision, explanation, next steps, disclaimer) for easy scanning.
 
 ---
 
 ## 12. Further Notes
 
-**Assumptions made (to be confirmed)**:
-- No authentication is required for MVP; the app is deployed on a secured internal network.
-- "Wymaga weryfikacji" cases are handled by the employee escalating to a supervisor outside the system (no in-app escalation flow in MVP).
-- The procedure documents (`complaint-procedure.md`, `return-procedure.md`) are static files loaded at application startup. No UI for updating them in MVP.
-- The application is a single-page web app; no multi-tab or multi-session management is needed.
-- Return window and complaint eligibility rules are defined in the procedure documents. Example versions are provided in `docs/procedures/`.
-- Image compression algorithm and target format are decided in the ADR, not the PRD.
-- The thinking LLM model choice (which model supports "thinking" / extended reasoning) is decided in the ADR.
+### Planned Backlog (post-MVP — architecture should not preclude these)
+The following were deliberately deferred. They are listed so that the ADR and implementation can be designed with seams that make later addition straightforward (e.g. persistence layer, data-access interface, retrieval hook):
 
-**Open questions deferred to ADR**:
-- Which multimodal LLM and which thinking LLM to use.
-- Frontend framework and component library.
-- Backend language and framework.
-- Image compression library and target size/quality parameters.
-- Session state management (in-memory on backend vs. frontend).
-- Deployment environment and infrastructure.
+1. ~~**Session & decision persistence**~~ — **Delivered.** Each session, form data, image analysis, decision, and chat transcript is stored durably in an embedded **H2** database (Spring Data JPA) to build an audit trail — see `docs/ADR/004-persistence.md`. (SQLite was evaluated and rejected; the vector/RAG store is a separate, deferred decision — ADR-004 §6/§8.)
+2. **Uploaded image storage** — the case photo is currently *not* persisted (analyzed then discarded), so no thumbnail is shown on restore and the audit record has no image. Add durable image storage, ideally an **S3-compatible blob store** with only a reference (key) kept in the DB; mind privacy/retention of customer device photos. *(New — Backlog.)*
+3. **Customer & purchase-history lookup** — enrich decisions with existing customer/order data retrieved from a database.
+4. **Agent RAG knowledge base** — retrieval over electronics specifications and detailed return/complaint procedures beyond the two policy documents. *(Vector/embeddings store to be chosen in its own ADR after research — not SQLite; see ADR-004 §8.)*
+5. **Human reviewer console** — a back-office UI to act on **Needs human review** cases.
+
+### Assumptions made
+- Primary user is the **end customer** (self-service); the human triage reviewer is an indirect, secondary persona.
+- The decision is **advisory**; ambiguous cases escalate rather than guess.
+- Policy basis is **Polish consumer law**; the two starter policy documents are examples to be validated/replaced by the business.
+- One photo per case is sufficient for the MVP assessment.
+
+### Open questions / deferred decisions
+- Exact retention and audit requirements (depends on NBP/internal compliance). Persistence now keeps data **indefinitely** with no purge/anonymization (ADR-004 §4.4); a retention/TTL policy must be defined with compliance before any real deployment.
+- Whether HEIC/HEIF image support is needed for broader device coverage — currently excluded.
+- The precise SLA/latency target for the image-analysis + decision step — to be defined in the ADR/non-functional requirements.
